@@ -1,0 +1,244 @@
+# main.py
+import os
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+# -------------------------
+# HELPER: ambil data saham
+# -------------------------
+def get_stock_data(symbol):
+    symbol = symbol.replace(".JK", "")  # safety
+    ticker = yf.Ticker(symbol + ".JK")
+    data = ticker.history(period="1y")
+    if data.empty:
+        return None
+    return data
+
+# -------------------------
+# FUNDAMENTAL -> Fair Value
+# -------------------------
+def get_fundamental(symbol):
+    ticker = yf.Ticker(symbol + ".JK")
+    try:
+        info = ticker.info
+    except Exception:
+        return None
+
+    return {
+        "price": info.get("currentPrice"),
+        "eps": info.get("earningsPerShare"),
+        "pbv": info.get("priceToBook"),
+        "per": info.get("trailingPE"),
+        "sector": info.get("sector")
+    }
+
+def fair_value(symbol):
+    f = get_fundamental(symbol)
+    if not f:
+        return "❌ Data fundamental tidak ditemukan."
+
+    price = f.get("price")
+    eps = f.get("eps")
+    pbv = f.get("pbv")
+    per = f.get("per")
+    sector = f.get("sector")
+
+    # conservative calculations
+    fv_per = (eps * per) if (eps and per) else None
+    fv_pbv = (price / pbv * 1.5) if (price and pbv and pbv != 0) else None
+
+    sources = [v for v in [fv_per, fv_pbv] if v is not None]
+    if not sources:
+        return "❌ Tidak bisa menghitung harga wajar karena data tidak lengkap."
+
+    fv_final = sum(sources) / len(sources)
+
+    msg = []
+    msg.append(f"Harga Wajar untuk {symbol}.JK")
+    msg.append(f"Harga sekarang: {price if price else 'N/A'}")
+    msg.append("Data fundamental:")
+    msg.append(f"• EPS: {eps}")
+    msg.append(f"• PER (trailing): {per}")
+    msg.append(f"• PBV: {pbv}")
+    msg.append(f"• Sektor: {sector}")
+    msg.append(f"\nPerhitungan:")
+    if fv_per:
+        msg.append(f"• Berdasar PER x EPS -> {fv_per:,.2f}")
+    if fv_pbv:
+        msg.append(f"• Berdasar PBV (norma 1.5) -> {fv_pbv:,.2f}")
+    msg.append(f"\n→ Harga wajar (rata2): {fv_final:,.2f}")
+    msg.append("\nAlasan penilaian singkat:")
+    msg.append("- PER melihat harga relatif terhadap laba (EPS).")
+    msg.append("- PBV melihat harga relatif terhadap nilai buku.")
+    msg.append("- Mengambil rata-rata PER & PBV memberi hasil yang lebih stabil.")
+    msg.append("\nKesimpulan:")
+    if price and price < fv_final:
+        msg.append("Harga sekarang < harga wajar → *Undervalue* (menarik).")
+    elif price and price > fv_final:
+        msg.append("Harga sekarang > harga wajar → *Overvalue* (mahal).")
+    else:
+        msg.append("Data harga tidak tersedia untuk perbandingan.")
+    return "\n".join(msg)
+
+# -------------------------
+# TEKNIKAL: RSI, MACD, MA
+# -------------------------
+def hitung_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(window=period).mean()
+    loss = -delta.clip(upper=0).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def hitung_macd(series):
+    ema12 = series.ewm(span=12, adjust=False).mean()
+    ema26 = series.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    hist = macd - signal
+    return macd, signal, hist
+
+# -------------------------
+# Prediksi sederhana MA5 vs MA20
+# -------------------------
+def predict_price(data):
+    close = data["Close"]
+    ma5 = close.rolling(5).mean().iloc[-1]
+    ma20 = close.rolling(20).mean().iloc[-1]
+    return "Naik (MA5 > MA20)" if ma5 > ma20 else "Turun (MA5 < MA20)"
+
+# -------------------------
+# Sentimen berita (simple)
+# -------------------------
+def sentiment_news(symbol):
+    try:
+        url = f"https://news.google.com/search?q={symbol}+saham&hl=id&gl=ID&ceid=ID:id"
+        r = requests.get(url, timeout=6)
+        soup = BeautifulSoup(r.text, "html.parser")
+        titles = soup.find_all("a", class_="DY5T1d")
+        if not titles:
+            return "Tidak ada berita ditemukan."
+        sample = [t.get_text(strip=True) for t in titles[:5]]
+        text = " ".join(sample).lower()
+        score = 0
+        # very simple keyword score
+        for kw in ["naik","untung","positif","untungkan","naiknya"]:
+            if kw in text: score += 1
+        for kw in ["turun","rugi","negatif","merugi","anjlok"]:
+            if kw in text: score -= 1
+        label = "Netral"
+        if score > 0: label = "Positif"
+        if score < 0: label = "Negatif"
+        return f"{label} (score {score}) | contoh berita: {sample[0]}"
+    except Exception:
+        return "Gagal ambil berita."
+
+# -------------------------
+# Screener sederhana
+# -------------------------
+def screener():
+    tickers = ["BBRI","BBCA","BMRI","TLKM","ANTM","ASII","ADRO","BBNI","ICBP"]
+    out = []
+    for t in tickers:
+        d = get_stock_data(t)
+        if d is None: continue
+        close = d["Close"]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        if close.iloc[-1] > ma20:
+            out.append(t)
+    if not out:
+        return "Tidak ada hasil screener."
+    return "Screener hasil (MA20 breakout): " + ", ".join(out)
+
+# -------------------------
+# HANDLER TELEGRAM
+# -------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teks = (
+        "Halo! Aku *Bayi Saham Bot*.\n\n"
+        "Fitur yang tersedia:\n"
+        "1. Analisis saham: ketik kode, contoh `BBRI` atau `BBCA`.\n"
+        "2. Fair value (fundamental): ketik `FAIR <kode>` → contoh: `FAIR BBRI`.\n"
+        "3. Screener sederhana: ketik `SCREENER`.\n"
+        "4. Prediksi teknikal & indikator: otomatis tampil saat minta analisis.\n"
+        "5. Sentimen berita sederhana: otomatis tampil saat minta analisis.\n\n"
+        "Contoh percakapan:\n"
+        "- `BBRI`\n"
+        "- `FAIR TLKM`\n"
+        "- `SCREENER`\n\n"
+        "Catatan: untuk bekerja di group, matikan privacy di BotFather (setprivacy -> Disable)."
+    )
+    await update.message.reply_text(teks, parse_mode="Markdown")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ketik kode saham (contoh BBRI), atau `FAIR <kode>`, atau `SCREENER`.")
+
+async def respond(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_raw = update.message.text.strip()
+    text = text_raw.upper()
+
+    # FAIR command
+    if text.startswith("FAIR"):
+        symbol = text.replace("FAIR", "").strip()
+        if not symbol:
+            await update.message.reply_text("Contoh: FAIR BBRI")
+            return
+        resp = fair_value(symbol)
+        await update.message.reply_text(resp, parse_mode="Markdown")
+        return
+
+    if text == "SCREENER":
+        await update.message.reply_text(screener())
+        return
+
+    # assume ticker
+    symbol = text
+    d = get_stock_data(symbol)
+    if d is None:
+        await update.message.reply_text("Ticker tidak ditemukan. Coba contoh: BBRI")
+        return
+
+    close = d["Close"]
+    last_price = close.iloc[-1]
+    pred = predict_price(d)
+    rsi = hitung_rsi(close).iloc[-1]
+    macd, signal, hist = hitung_macd(close)
+    macd_now = macd.iloc[-1]; signal_now = signal.iloc[-1]
+    sent = sentiment_news(symbol)
+    sl = last_price * 0.97; tp = last_price * 1.05
+
+    reply = (
+        f"Analisis {symbol}.JK\n"
+        f"Harga terakhir: {last_price:.2f}\n"
+        f"Prediksi teknikal: {pred}\n"
+        f"RSI(14): {rsi:.2f}\n"
+        f"MACD vs Signal: {macd_now:.4f} / {signal_now:.4f}\n"
+        f"Sentimen berita: {sent}\n"
+        f"SL: {sl:.2f} | TP: {tp:.2f}\n"
+        f"Ketik `FAIR {symbol}` untuk harga wajar berdasar fundamental."
+    )
+    await update.message.reply_text(reply)
+
+# -------------------------
+# RUN APP
+# -------------------------
+def main():
+    TOKEN = os.getenv("BOT_TOKEN")
+    if not TOKEN:
+        print("ERROR: BOT_TOKEN environment variable not set.")
+        return
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), respond))
+    print("Bot starting...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
